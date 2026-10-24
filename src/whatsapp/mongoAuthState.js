@@ -14,7 +14,7 @@ export async function hasRegisteredCreds(tutorId) {
     if (!doc || !doc.value) return false;
     const decrypted = decrypt(doc.value);
     const creds = JSON.parse(decrypted, BufferJSON.reviver);
-    return Boolean(creds?.registered || creds?.account);
+    return Boolean(creds?.registered || creds?.account || creds?.me);
   } catch (err) {
     return false;
   }
@@ -102,7 +102,12 @@ export async function useMongoAuthState(tutorId) {
         }
       }
     },
-    saveCreds: () => writeData('creds', creds),
+    saveCreds: (update) => {
+      if (update && typeof update === 'object') {
+        Object.assign(creds, update);
+      }
+      return writeData('creds', creds);
+    },
     clearAll: async () => {
       await WaAuth.deleteMany({ tutorId: tutorIdStr });
     }

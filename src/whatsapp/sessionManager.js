@@ -96,7 +96,7 @@ export async function startSession(tutorId, options = {}) {
 
   // If this is a fresh user request (not an automatic reconnect)
   // and credentials are not registered, start with fresh creds
-  if (!options.isReconnect && !state.creds?.registered && !state.creds?.account) {
+  if (!options.isReconnect && !state.creds?.registered && !state.creds?.account && !state.creds?.me) {
     await clearAll();
     state.creds = initAuthCreds();
     await saveCreds();
@@ -110,7 +110,7 @@ export async function startSession(tutorId, options = {}) {
   );
 
   const { version } = await fetchLatestBaileysVersion().catch(() => ({
-    version: [2, 3000, 1015901307],
+    version: [2, 3000, 1043857760],
     isLatest: false
   }));
 
@@ -119,7 +119,7 @@ export async function startSession(tutorId, options = {}) {
     logger,
     printQRInTerminal: false,
     auth: state,
-    browser: Browsers.ubuntu('Chrome'),
+    browser: Browsers.macOS('Desktop'),
     syncFullHistory: false, // Prevents memory bloat & Bad MAC disconnects
     getMessage: async () => undefined, // Prevents crash on background notification decryption
     defaultQueryTimeoutMs: undefined, // Prevents timeout cancellation on slow init queries
@@ -139,8 +139,8 @@ export async function startSession(tutorId, options = {}) {
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
-    // QR Mode: Save QR to database when received
-    if (qr && method === 'qr') {
+    // QR Mode: Save QR to database when received (only if not yet registered)
+    if (qr && method === 'qr' && !state.creds?.registered && !state.creds?.me) {
       await WaSession.findOneAndUpdate(
         { tutorId: tutorIdStr },
         { status: 'qr_ready', qr, pairingCode: null },
@@ -149,8 +149,15 @@ export async function startSession(tutorId, options = {}) {
       console.log(`[Baileys] QR code ready for tutor ${tutorIdStr}`);
     }
 
-    // Pairing Code Mode: Request pairing code when ready
-    if (method === 'code' && options.phoneNumber && !pairingCodeRequested && (qr || connection === 'open')) {
+    // Pairing Code Mode: Request pairing code when ready (only if not yet registered)
+    if (
+      method === 'code' &&
+      options.phoneNumber &&
+      !pairingCodeRequested &&
+      !state.creds?.registered &&
+      !state.creds?.me &&
+      (qr || connection === 'connecting' || connection === 'open')
+    ) {
       pairingCodeRequested = true;
       const cleanPhone = cleanPhoneNumberForPairing(options.phoneNumber);
 
@@ -172,14 +179,15 @@ export async function startSession(tutorId, options = {}) {
         );
       } catch (err) {
         console.error(`[Baileys] requestPairingCode error for tutor ${tutorIdStr}:`, err.message);
-        await WaSession.findOneAndUpdate(
-          { tutorId: tutorIdStr },
-          { status: 'disconnected', pairingCode: null, qr: null }
-        );
       }
     }
 
     if (connection === 'close') {
+      // If a newer socket has already replaced this one, ignore events from this dead socket
+      if (sockets.get(tutorIdStr) !== sock && sockets.has(tutorIdStr)) {
+        return;
+      }
+
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const isLoggedOut = statusCode === DisconnectReason.loggedOut; // 401
       const isRestartRequired = statusCode === DisconnectReason.restartRequired; // 515
@@ -187,10 +195,9 @@ export async function startSession(tutorId, options = {}) {
 
       console.log(`[Baileys] Connection closed for tutor ${tutorIdStr}, code: ${statusCode}, shouldReconnect: ${shouldReconnect}`);
 
-      sockets.delete(tutorIdStr);
-
-      if (!shouldReconnect) {
+      if (isLoggedOut) {
         // Disconnected permanently / logged out from phone
+        sockets.delete(tutorIdStr);
         reconnectAttempts.delete(tutorIdStr);
         await clearAll();
         await WaSession.findOneAndUpdate(
@@ -340,6 +347,7 @@ export async function getSessionStatus(tutorId) {
   const tutorIdStr = tutorId.toString();
   const dbSession = await WaSession.findOne({ tutorId: tutorIdStr });
   const inMemorySock = sockets.get(tutorIdStr);
+  const isPendingReconnect = reconnectTimers.has(tutorIdStr);
 
   const isActuallyConnected = Boolean(inMemorySock?.user?.id && dbSession?.status === 'connected');
 
@@ -348,8 +356,10 @@ export async function getSessionStatus(tutorId) {
     status = 'connected';
   } else if (inMemorySock) {
     status = dbSession?.status || 'connecting';
+  } else if (isPendingReconnect) {
+    status = 'connecting';
   } else {
-    // No active socket in memory: check if tutor has registered credentials in MongoDB
+    // No active socket or timer in memory: check if tutor has registered credentials in MongoDB
     const hasCreds = await hasRegisteredCreds(tutorIdStr);
 
     if (hasCreds) {
@@ -362,14 +372,18 @@ export async function getSessionStatus(tutorId) {
       }
       status = 'connecting';
     } else {
-      // Truly disconnected with no auth credentials
-      if (dbSession && ['connecting', 'qr_ready', 'code_ready'].includes(dbSession.status)) {
-        await WaSession.updateOne(
-          { tutorId: tutorIdStr },
-          { status: 'disconnected', qr: null, pairingCode: null }
-        );
+      // If DB has an active pairing code or QR that hasn't timed out (e.g. within 90s), preserve it!
+      const isRecentPairing =
+        dbSession &&
+        ['qr_ready', 'code_ready'].includes(dbSession.status) &&
+        dbSession.updatedAt &&
+        Date.now() - new Date(dbSession.updatedAt).getTime() < 90000;
+
+      if (isRecentPairing) {
+        status = dbSession.status;
+      } else {
+        status = 'disconnected';
       }
-      status = 'disconnected';
     }
   }
 
