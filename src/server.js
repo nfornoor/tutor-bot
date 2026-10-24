@@ -38,6 +38,23 @@ app.get('/health', (req, res) => {
   });
 });
 
+// Lazy DB connection middleware (supports serverless environments like Vercel Functions)
+app.use(async (req, res, next) => {
+  if (req.path === '/health' || req.path === '/favicon.ico') {
+    return next();
+  }
+  try {
+    await ensureDbConnected();
+    next();
+  } catch (err) {
+    console.error('[DB] Request failed due to database connection error:', err.message);
+    res.status(503).json({
+      success: false,
+      error: `Database unavailable: ${err.message}`
+    });
+  }
+});
+
 // Mount API routes under both /api and root to support all path conventions
 app.use('/api', routes);
 app.use('/', routes);
@@ -56,6 +73,27 @@ app.use((err, req, res, next) => {
   });
 });
 
+let dbConnectionPromise = null;
+
+/**
+ * Ensures MongoDB is connected, reusing existing connections across invocations
+ */
+export async function ensureDbConnected() {
+  if (mongoose.connection.readyState === 1) return;
+  if (!dbConnectionPromise) {
+    dbConnectionPromise = connectDatabase()
+      .then(async () => {
+        await ensureStudentShareTokens().catch((err) => {
+          console.warn('[DB] Warning in ensureStudentShareTokens:', err.message);
+        });
+      })
+      .finally(() => {
+        dbConnectionPromise = null;
+      });
+  }
+  return dbConnectionPromise;
+}
+
 /**
  * Connect to MongoDB with automated in-memory fallback for smooth local testing
  */
@@ -63,7 +101,7 @@ export async function connectDatabase() {
   try {
     console.log(`[DB] Attempting connection to MongoDB at ${config.mongodbUri}...`);
     await mongoose.connect(config.mongodbUri, {
-      serverSelectionTimeoutMS: 3000
+      serverSelectionTimeoutMS: 5000
     });
     console.log('[DB] Connected to MongoDB successfully.');
   } catch (err) {
@@ -84,15 +122,14 @@ export async function connectDatabase() {
       }
     } else {
       console.error('[DB] Fatal: MongoDB connection required in production mode.');
-      process.exit(1);
+      throw new Error(`MongoDB connection failed (${err.message}). Check MONGODB_URI in environment variables.`);
     }
   }
 }
 
 // Start Server
 export async function bootstrap() {
-  await connectDatabase();
-  await ensureStudentShareTokens();
+  await ensureDbConnected();
 
   // Reconnect Baileys sessions for tutors who were previously connected
   await initAllSessions();
