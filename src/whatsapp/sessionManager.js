@@ -1,5 +1,6 @@
 import makeWASocket, {
   DisconnectReason,
+  fetchLatestWaWebVersion,
   fetchLatestBaileysVersion,
   Browsers,
   initAuthCreds
@@ -121,10 +122,14 @@ export async function startSession(tutorId, options = {}) {
       { upsert: true, new: true }
     );
 
-    const { version } = await fetchLatestBaileysVersion().catch(() => ({
-      version: [2, 3000, 1043857760],
-      isLatest: false
-    }));
+    const { version } = await fetchLatestWaWebVersion().catch(async () => {
+      const fallback = await fetchLatestBaileysVersion().catch(() => null);
+      return {
+        version: fallback?.version || [2, 3000, 1051617046],
+        isLatest: true
+      };
+    });
+    console.log(`[Baileys] Using WhatsApp Web protocol version: ${version.join('.')}`);
 
     const sock = makeWASocket({
       version,
