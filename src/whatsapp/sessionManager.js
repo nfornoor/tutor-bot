@@ -17,6 +17,9 @@ const reconnectTimers = new Map();
 // Map of reconnect attempts count: tutorId string -> number
 const reconnectAttempts = new Map();
 
+// Mutex lock to prevent duplicate concurrent session initializations for the same tutor
+const sessionStartLocks = new Map();
+
 // Pino logger: use 'warn' to catch connection warnings without flood
 const logger = pino({ level: 'warn' });
 
@@ -70,198 +73,215 @@ export function cleanPhoneNumberForPairing(phone) {
  */
 export async function startSession(tutorId, options = {}) {
   const tutorIdStr = tutorId.toString();
-  const method = options.method || 'qr';
 
-  // Clear any existing reconnect timer for this tutor
-  if (reconnectTimers.has(tutorIdStr)) {
-    clearTimeout(reconnectTimers.get(tutorIdStr));
-    reconnectTimers.delete(tutorIdStr);
+  // If a session start is already running for this tutor, reuse the ongoing promise (prevents duplicate sockets)
+  if (sessionStartLocks.has(tutorIdStr)) {
+    console.log(`[Baileys] Session start already in flight for tutor ${tutorIdStr}, awaiting lock...`);
+    return await sessionStartLocks.get(tutorIdStr);
   }
 
-  // If already connected, return existing socket info
-  if (sockets.has(tutorIdStr)) {
-    const existingSock = sockets.get(tutorIdStr);
-    if (existingSock?.user?.id) {
-      const phone = existingSock.user.id.split(':')[0];
-      return { status: 'connected', phone };
-    }
-    // Clean up unconnected socket to start a fresh pairing attempt
-    try {
-      existingSock.end?.(new Error('RESTARTING_SESSION'));
-    } catch (e) {}
-    sockets.delete(tutorIdStr);
-  }
+  const startPromise = (async () => {
+    const method = options.method || 'qr';
 
-  const { state, saveCreds, clearAll } = await useMongoAuthState(tutorIdStr);
-
-  // If this is a fresh user request (not an automatic reconnect)
-  // and credentials are not registered, start with fresh creds
-  if (!options.isReconnect && !state.creds?.registered && !state.creds?.account && !state.creds?.me) {
-    await clearAll();
-    state.creds = initAuthCreds();
-    await saveCreds();
-  }
-
-  // Update DB status to connecting
-  await WaSession.findOneAndUpdate(
-    { tutorId: tutorIdStr },
-    { status: 'connecting', qr: null, pairingCode: null },
-    { upsert: true, new: true }
-  );
-
-  const { version } = await fetchLatestBaileysVersion().catch(() => ({
-    version: [2, 3000, 1043857760],
-    isLatest: false
-  }));
-
-  const sock = makeWASocket({
-    version,
-    logger,
-    printQRInTerminal: false,
-    auth: state,
-    browser: Browsers.macOS('Desktop'),
-    syncFullHistory: false, // Prevents memory bloat & Bad MAC disconnects
-    getMessage: async () => undefined, // Prevents crash on background notification decryption
-    defaultQueryTimeoutMs: undefined, // Prevents timeout cancellation on slow init queries
-    connectTimeoutMs: 60000,
-    keepAliveIntervalMs: 25000,
-    generateHighQualityLinkPreview: false,
-    markOnlineOnConnect: false,
-    fireInitQueries: false
-  });
-
-  sockets.set(tutorIdStr, sock);
-
-  sock.ev.on('creds.update', saveCreds);
-
-  let pairingCodeRequested = false;
-
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    // QR Mode: Save QR to database when received (only if not yet registered)
-    if (qr && method === 'qr' && !state.creds?.registered && !state.creds?.me) {
-      await WaSession.findOneAndUpdate(
-        { tutorId: tutorIdStr },
-        { status: 'qr_ready', qr, pairingCode: null },
-        { upsert: true }
-      );
-      console.log(`[Baileys] QR code ready for tutor ${tutorIdStr}`);
+    // Clear any existing reconnect timer for this tutor
+    if (reconnectTimers.has(tutorIdStr)) {
+      clearTimeout(reconnectTimers.get(tutorIdStr));
+      reconnectTimers.delete(tutorIdStr);
     }
 
-    // Pairing Code Mode: Request pairing code when ready (only if not yet registered)
-    if (
-      method === 'code' &&
-      options.phoneNumber &&
-      !pairingCodeRequested &&
-      !state.creds?.registered &&
-      !state.creds?.me &&
-      (qr || connection === 'connecting' || connection === 'open')
-    ) {
-      pairingCodeRequested = true;
-      const cleanPhone = cleanPhoneNumberForPairing(options.phoneNumber);
-
+    // If already connected, return existing socket info
+    if (sockets.has(tutorIdStr)) {
+      const existingSock = sockets.get(tutorIdStr);
+      if (existingSock?.user?.id) {
+        const phone = existingSock.user.id.split(':')[0];
+        return { status: 'connected', phone };
+      }
+      // Clean up unconnected socket to start a fresh pairing attempt
       try {
-        console.log(`[Baileys] Requesting pairing code for ${cleanPhone}...`);
-        const rawCode = await sock.requestPairingCode(cleanPhone);
-        const formattedCode = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
-        console.log(`[Baileys] Pairing code ready for tutor ${tutorIdStr}: ${formattedCode}`);
+        existingSock.ev?.removeAllListeners();
+        existingSock.end?.(new Error('RESTARTING_SESSION'));
+      } catch (e) {}
+      sockets.delete(tutorIdStr);
+    }
+
+    const { state, saveCreds, clearAll } = await useMongoAuthState(tutorIdStr);
+
+    // If this is a fresh user request (not an automatic reconnect)
+    // and credentials are not registered, start with fresh creds
+    if (!options.isReconnect && !state.creds?.registered && !state.creds?.account && !state.creds?.me) {
+      await clearAll();
+      state.creds = initAuthCreds();
+      await saveCreds();
+    }
+
+    // Update DB status to connecting
+    await WaSession.findOneAndUpdate(
+      { tutorId: tutorIdStr },
+      { status: 'connecting', qr: null, pairingCode: null },
+      { upsert: true, new: true }
+    );
+
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({
+      version: [2, 3000, 1043857760],
+      isLatest: false
+    }));
+
+    const sock = makeWASocket({
+      version,
+      logger,
+      printQRInTerminal: false,
+      auth: state,
+      browser: Browsers.macOS('Desktop'),
+      syncFullHistory: false, // Prevents memory bloat & Bad MAC disconnects
+      getMessage: async () => undefined, // Prevents crash on background notification decryption
+      defaultQueryTimeoutMs: undefined, // Prevents timeout cancellation on slow init queries
+      connectTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+      generateHighQualityLinkPreview: false,
+      markOnlineOnConnect: false,
+      fireInitQueries: false
+    });
+
+    sockets.set(tutorIdStr, sock);
+
+    sock.ev.on('creds.update', saveCreds);
+
+    let pairingCodeRequested = false;
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      // QR Mode: Save QR to database when received (only if not yet registered)
+      if (qr && method === 'qr' && !state.creds?.registered && !state.creds?.me) {
+        await WaSession.findOneAndUpdate(
+          { tutorId: tutorIdStr },
+          { status: 'qr_ready', qr, pairingCode: null },
+          { upsert: true }
+        );
+        console.log(`[Baileys] QR code ready for tutor ${tutorIdStr}`);
+      }
+
+      // Pairing Code Mode: Request pairing code when ready (only if not yet registered)
+      if (
+        method === 'code' &&
+        options.phoneNumber &&
+        !pairingCodeRequested &&
+        !state.creds?.registered &&
+        !state.creds?.me &&
+        (qr || connection === 'connecting' || connection === 'open')
+      ) {
+        pairingCodeRequested = true;
+        const cleanPhone = cleanPhoneNumberForPairing(options.phoneNumber);
+
+        try {
+          console.log(`[Baileys] Requesting pairing code for ${cleanPhone}...`);
+          const rawCode = await sock.requestPairingCode(cleanPhone);
+          const formattedCode = rawCode?.match(/.{1,4}/g)?.join('-') || rawCode;
+          console.log(`[Baileys] Pairing code ready for tutor ${tutorIdStr}: ${formattedCode}`);
+
+          await WaSession.findOneAndUpdate(
+            { tutorId: tutorIdStr },
+            {
+              status: 'code_ready',
+              pairingCode: formattedCode,
+              phone: cleanPhone,
+              qr: null
+            },
+            { upsert: true }
+          );
+        } catch (err) {
+          console.error(`[Baileys] requestPairingCode error for tutor ${tutorIdStr}:`, err.message);
+        }
+      }
+
+      if (connection === 'close') {
+        // If a newer socket has already replaced this one, ignore events from this dead socket
+        if (sockets.get(tutorIdStr) !== sock && sockets.has(tutorIdStr)) {
+          return;
+        }
+
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut; // 401
+        const isRestartRequired = statusCode === DisconnectReason.restartRequired; // 515
+        const shouldReconnect = !isLoggedOut;
+
+        console.log(`[Baileys] Connection closed for tutor ${tutorIdStr}, code: ${statusCode}, shouldReconnect: ${shouldReconnect}`);
+
+        if (isLoggedOut) {
+          // Disconnected permanently / logged out from phone
+          sockets.delete(tutorIdStr);
+          reconnectAttempts.delete(tutorIdStr);
+          await clearAll();
+          await WaSession.findOneAndUpdate(
+            { tutorId: tutorIdStr },
+            { status: 'disconnected', qr: null, pairingCode: null, phone: null }
+          );
+          console.log(`[Baileys] Tutor ${tutorIdStr} was logged out permanently.`);
+        } else {
+          // Automatic reconnection with backoff
+          await WaSession.findOneAndUpdate(
+            { tutorId: tutorIdStr },
+            { status: 'connecting' }
+          );
+
+          const currentAttempts = reconnectAttempts.get(tutorIdStr) || 0;
+          reconnectAttempts.set(tutorIdStr, currentAttempts + 1);
+
+          // Code 515 (restartRequired) is sent right after scanning:
+          // WhatsApp requires 2000ms for companion registration before reconnecting
+          const delay = isRestartRequired
+            ? 2000
+            : Math.min(30000, Math.floor(1000 * Math.pow(1.5, Math.min(currentAttempts, 8))));
+
+          console.log(`[Baileys] Scheduling auto-reconnect (attempt ${currentAttempts + 1}) in ${delay}ms for tutor ${tutorIdStr}...`);
+
+          const timer = setTimeout(() => {
+            startSession(tutorIdStr, {
+              method,
+              phoneNumber: options.phoneNumber,
+              isReconnect: true
+            }).catch((err) => {
+              console.error(`[Baileys] Reconnect failed for tutor ${tutorIdStr}:`, err.message);
+            });
+          }, delay);
+
+          reconnectTimers.set(tutorIdStr, timer);
+        }
+      } else if (connection === 'open') {
+        // Successfully connected!
+        reconnectAttempts.delete(tutorIdStr);
+        if (reconnectTimers.has(tutorIdStr)) {
+          clearTimeout(reconnectTimers.get(tutorIdStr));
+          reconnectTimers.delete(tutorIdStr);
+        }
+
+        const fullJid = sock.user?.id || '';
+        const rawPhone = fullJid.split(':')[0] || fullJid.split('@')[0];
 
         await WaSession.findOneAndUpdate(
           { tutorId: tutorIdStr },
           {
-            status: 'code_ready',
-            pairingCode: formattedCode,
-            phone: cleanPhone,
-            qr: null
+            status: 'connected',
+            phone: rawPhone,
+            qr: null,
+            pairingCode: null,
+            lastConnectedAt: new Date()
           },
           { upsert: true }
         );
-      } catch (err) {
-        console.error(`[Baileys] requestPairingCode error for tutor ${tutorIdStr}:`, err.message);
+        console.log(`[Baileys] Connected successfully for tutor ${tutorIdStr} (${rawPhone})`);
       }
-    }
+    });
 
-    if (connection === 'close') {
-      // If a newer socket has already replaced this one, ignore events from this dead socket
-      if (sockets.get(tutorIdStr) !== sock && sockets.has(tutorIdStr)) {
-        return;
-      }
+    return { status: 'connecting', method };
+  })();
 
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const isLoggedOut = statusCode === DisconnectReason.loggedOut; // 401
-      const isRestartRequired = statusCode === DisconnectReason.restartRequired; // 515
-      const shouldReconnect = !isLoggedOut;
-
-      console.log(`[Baileys] Connection closed for tutor ${tutorIdStr}, code: ${statusCode}, shouldReconnect: ${shouldReconnect}`);
-
-      if (isLoggedOut) {
-        // Disconnected permanently / logged out from phone
-        sockets.delete(tutorIdStr);
-        reconnectAttempts.delete(tutorIdStr);
-        await clearAll();
-        await WaSession.findOneAndUpdate(
-          { tutorId: tutorIdStr },
-          { status: 'disconnected', qr: null, pairingCode: null, phone: null }
-        );
-        console.log(`[Baileys] Tutor ${tutorIdStr} was logged out permanently.`);
-      } else {
-        // Automatic reconnection with exponential backoff
-        await WaSession.findOneAndUpdate(
-          { tutorId: tutorIdStr },
-          { status: 'connecting' }
-        );
-
-        const currentAttempts = reconnectAttempts.get(tutorIdStr) || 0;
-        reconnectAttempts.set(tutorIdStr, currentAttempts + 1);
-
-        // Code 515 (restartRequired) is sent right after scanning: reconnect immediately in 500ms
-        // Other disconnects (network drops): backoff 1.5s, 3s, 5s, 10s... up to 30s
-        const delay = isRestartRequired
-          ? 500
-          : Math.min(30000, Math.floor(1000 * Math.pow(1.5, Math.min(currentAttempts, 8))));
-
-        console.log(`[Baileys] Scheduling auto-reconnect (attempt ${currentAttempts + 1}) in ${delay}ms for tutor ${tutorIdStr}...`);
-
-        const timer = setTimeout(() => {
-          startSession(tutorIdStr, {
-            method,
-            phoneNumber: options.phoneNumber,
-            isReconnect: true
-          }).catch((err) => {
-            console.error(`[Baileys] Reconnect failed for tutor ${tutorIdStr}:`, err.message);
-          });
-        }, delay);
-
-        reconnectTimers.set(tutorIdStr, timer);
-      }
-    } else if (connection === 'open') {
-      // Successfully connected!
-      reconnectAttempts.delete(tutorIdStr);
-      if (reconnectTimers.has(tutorIdStr)) {
-        clearTimeout(reconnectTimers.get(tutorIdStr));
-        reconnectTimers.delete(tutorIdStr);
-      }
-
-      const fullJid = sock.user?.id || '';
-      const rawPhone = fullJid.split(':')[0] || fullJid.split('@')[0];
-
-      await WaSession.findOneAndUpdate(
-        { tutorId: tutorIdStr },
-        {
-          status: 'connected',
-          phone: rawPhone,
-          qr: null,
-          pairingCode: null,
-          lastConnectedAt: new Date()
-        },
-        { upsert: true }
-      );
-      console.log(`[Baileys] Connected successfully for tutor ${tutorIdStr} (${rawPhone})`);
-    }
-  });
-
-  return { status: 'connecting', method };
+  sessionStartLocks.set(tutorIdStr, startPromise);
+  try {
+    return await startPromise;
+  } finally {
+    sessionStartLocks.delete(tutorIdStr);
+  }
 }
 
 /**
@@ -281,6 +301,7 @@ export async function disconnectSession(tutorId) {
   const sock = sockets.get(tutorIdStr);
   if (sock) {
     try {
+      sock.ev?.removeAllListeners();
       await sock.logout();
     } catch (err) {
       console.warn(`[Baileys] Error during logout for tutor ${tutorIdStr}:`, err.message);
@@ -315,6 +336,7 @@ export function closeSocketOnly(tutorId) {
   const sock = sockets.get(tutorIdStr);
   if (sock) {
     try {
+      sock.ev?.removeAllListeners();
       sock.end?.(new Error('TUTOR_SUSPENDED'));
     } catch (e) {}
     sockets.delete(tutorIdStr);
@@ -340,7 +362,8 @@ export async function sendBaileysMessage(tutorId, toPhone, text) {
 }
 
 /**
- * Checks in-memory and database status of tutor's session
+ * Checks in-memory and database status of tutor's session (Strictly Read-Only)
+ * Does NOT spawn duplicate sockets or overwrite database state
  * @param {string|import('mongoose').Types.ObjectId} tutorId
  */
 export async function getSessionStatus(tutorId) {
@@ -348,42 +371,27 @@ export async function getSessionStatus(tutorId) {
   const dbSession = await WaSession.findOne({ tutorId: tutorIdStr });
   const inMemorySock = sockets.get(tutorIdStr);
   const isPendingReconnect = reconnectTimers.has(tutorIdStr);
+  const isStarting = sessionStartLocks.has(tutorIdStr);
 
   const isActuallyConnected = Boolean(inMemorySock?.user?.id && dbSession?.status === 'connected');
 
   let status = 'disconnected';
   if (isActuallyConnected) {
     status = 'connected';
-  } else if (inMemorySock) {
+  } else if (inMemorySock || isPendingReconnect || isStarting) {
     status = dbSession?.status || 'connecting';
-  } else if (isPendingReconnect) {
-    status = 'connecting';
   } else {
-    // No active socket or timer in memory: check if tutor has registered credentials in MongoDB
-    const hasCreds = await hasRegisteredCreds(tutorIdStr);
+    // If DB has an active pairing code or QR that hasn't timed out (within 90s), preserve it!
+    const isRecentPairing =
+      dbSession &&
+      ['qr_ready', 'code_ready'].includes(dbSession.status) &&
+      dbSession.updatedAt &&
+      Date.now() - new Date(dbSession.updatedAt).getTime() < 90000;
 
-    if (hasCreds) {
-      // Registered session exists in DB! Trigger background reconnect if not already scheduled
-      if (!reconnectTimers.has(tutorIdStr)) {
-        console.log(`[Baileys] Auto-reconnecting registered session for tutor ${tutorIdStr}...`);
-        startSession(tutorIdStr, { isReconnect: true }).catch((err) => {
-          console.error(`[Baileys] Background reconnect error for tutor ${tutorIdStr}:`, err.message);
-        });
-      }
-      status = 'connecting';
+    if (isRecentPairing) {
+      status = dbSession.status;
     } else {
-      // If DB has an active pairing code or QR that hasn't timed out (e.g. within 90s), preserve it!
-      const isRecentPairing =
-        dbSession &&
-        ['qr_ready', 'code_ready'].includes(dbSession.status) &&
-        dbSession.updatedAt &&
-        Date.now() - new Date(dbSession.updatedAt).getTime() < 90000;
-
-      if (isRecentPairing) {
-        status = dbSession.status;
-      } else {
-        status = 'disconnected';
-      }
+      status = 'disconnected';
     }
   }
 

@@ -17,6 +17,7 @@ export const authLimiter = rateLimit({
   skip: (req) => isLocalhost(req),
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: {
     success: false,
     error: 'Too many login attempts. Please try again after 15 minutes.'
@@ -29,6 +30,7 @@ export const waConnectLimiter = rateLimit({
   max: isDev ? 120 : 6,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: {
     success: false,
     error: 'Too many connection attempts. Please wait a moment before trying again.'
@@ -41,6 +43,7 @@ export const adminLimiter = rateLimit({
   max: isDev ? 10000 : 600,
   standardHeaders: true,
   legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
   message: {
     success: false,
     error: 'Too many admin requests. Please slow down and try again later.'
@@ -53,5 +56,6 @@ export const apiLimiter = rateLimit({
   max: isDev ? 10000 : 300,
   skip: (req) => isLocalhost(req),
   standardHeaders: true,
-  legacyHeaders: false
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false }
 });

@@ -10,6 +10,9 @@ import { ensureStudentShareTokens } from './models/Student.js';
 
 const app = express();
 
+// Trust first proxy (Render, Cloudflare, Nginx) so req.ip and express-rate-limit work correctly
+app.set('trust proxy', 1);
+
 // Security and utility middleware
 app.use(
   cors({
