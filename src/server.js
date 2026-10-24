@@ -14,8 +14,15 @@ const app = express();
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow requests with no origin (like mobile apps, curl, postman) or matching clientUrl / localhost
-      if (!origin || origin === config.clientUrl || origin.includes('localhost') || origin.includes('127.0.0.1')) {
+      // Allow requests with no origin, matching clientUrl, localhost, netlify or vercel
+      if (
+        !origin ||
+        origin === config.clientUrl ||
+        origin.includes('localhost') ||
+        origin.includes('127.0.0.1') ||
+        origin.includes('netlify.app') ||
+        origin.includes('vercel.app')
+      ) {
         return callback(null, true);
       }
       return callback(null, true); // Permissive in dev, lock to Netlify origin in prod
